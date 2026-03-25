@@ -66,9 +66,9 @@ export default function Home() {
             Browse All Manga
           </Link>
         </div>
-        <div style={styles.heroDecor}>
+        <div className="hero-decor" style={styles.heroDecor}>
           {['📖', '⚔️', '🌸', '🔥', '✨'].map((e, i) => (
-            <div key={i} style={{ ...styles.heroEmoji, animationDelay: `${i * 0.4}s`, top: `${15 + i * 15}%`, left: `${10 + i * 18}%` }}>{e}</div>
+            <div key={i} style={{ ...styles.heroEmoji, animationDelay: `${i * 0.4}s`, top: `${20 + i * 14}%`, right: `${4 + i * 5}%`, left: 'auto' }}>{e}</div>
           ))}
         </div>
       </div>
@@ -176,8 +176,8 @@ const styles = {
   },
   heroEmoji: {
     position: 'absolute',
-    fontSize: 32,
-    opacity: 0.08,
+    fontSize: 40,
+    opacity: 0.1,
     animation: 'pulse 3s ease-in-out infinite',
   },
   container: {
