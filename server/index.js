@@ -6,7 +6,7 @@ const rateLimit = require('express-rate-limit');
 const path = require('path');
 
 const app = express();
-const cache = new NodeCache({ stdTTL: 300 }); // 5 min cache
+const cache = new NodeCache({ stdTTL: 300 });
 const PORT = process.env.PORT || 3001;
 
 const MANGADEX_API = 'https://api.mangadex.org';
@@ -15,14 +15,61 @@ const MANGADEX_UPLOADS = 'https://uploads.mangadex.org';
 app.use(cors());
 app.use(express.json());
 
-// Rate limiting
-const limiter = rateLimit({ windowMs: 60000, max: 100 });
+const limiter = rateLimit({ windowMs: 60000, max: 200 });
 app.use('/api/', limiter);
 
-// ── Search manga ──────────────────────────────────────────────────────────────
+// Axios instance that serializes arrays as repeated keys: key[]=a&key[]=b
+const mdx = axios.create({
+  baseURL: MANGADEX_API,
+  paramsSerializer: (params) => {
+    const parts = [];
+    for (const [key, val] of Object.entries(params)) {
+      if (Array.isArray(val)) {
+        val.forEach(v => parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(v)}`));
+      } else if (val !== undefined && val !== null) {
+        parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(val)}`);
+      }
+    }
+    return parts.join('&');
+  },
+});
+
+// ── Popular/trending — MUST be before /api/manga/:id ──────────────────────────
+app.get('/api/manga/popular', async (req, res) => {
+  try {
+    const cacheKey = 'popular';
+    const cached = cache.get(cacheKey);
+    if (cached) return res.json(cached);
+
+    const response = await mdx.get('/manga', {
+      params: {
+        limit: 20,
+        'order[followedCount]': 'desc',
+        'includes[]': ['cover_art'],
+        'contentRating[]': ['safe', 'suggestive'],
+        hasAvailableChapters: 'true',
+      },
+    });
+    cache.set(cacheKey, response.data, 600);
+    res.json(response.data);
+  } catch (err) {
+    console.error('popular error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Search manga — MUST be before /api/manga/:id ───────────────────────────────
 app.get('/api/manga/search', async (req, res) => {
   try {
-    const { q, genres, status, contentRating = 'safe,suggestive', limit = 20, offset = 0 } = req.query;
+    const {
+      q, genres, status,
+      limit = 20, offset = 0,
+    } = req.query;
+
+    // Support contentRating as comma-string or array
+    let ratings = req.query.contentRating || req.query['contentRating[]'] || 'safe,suggestive';
+    if (!Array.isArray(ratings)) ratings = ratings.split(',');
+
     const cacheKey = `search:${JSON.stringify(req.query)}`;
     const cached = cache.get(cacheKey);
     if (cached) return res.json(cached);
@@ -30,19 +77,21 @@ app.get('/api/manga/search', async (req, res) => {
     const params = {
       limit,
       offset,
-      'order[relevance]': 'desc',
+      'order[followedCount]': 'desc',
       'includes[]': ['cover_art', 'author', 'artist'],
-      'contentRating[]': contentRating.split(','),
+      'contentRating[]': ratings,
+      hasAvailableChapters: 'true',
     };
 
-    if (q) params.title = q;
-    if (status) params['status[]'] = status.split(',');
-    if (genres) params['includedTags[]'] = genres.split(',');
+    if (q && q.trim()) params.title = q.trim();
+    if (status) params['status[]'] = Array.isArray(status) ? status : status.split(',');
+    if (genres) params['includedTags[]'] = Array.isArray(genres) ? genres : genres.split(',');
 
-    const response = await axios.get(`${MANGADEX_API}/manga`, { params });
+    const response = await mdx.get('/manga', { params });
     cache.set(cacheKey, response.data);
     res.json(response.data);
   } catch (err) {
+    console.error('search error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -54,12 +103,13 @@ app.get('/api/manga/:id', async (req, res) => {
     const cached = cache.get(cacheKey);
     if (cached) return res.json(cached);
 
-    const response = await axios.get(`${MANGADEX_API}/manga/${req.params.id}`, {
+    const response = await mdx.get(`/manga/${req.params.id}`, {
       params: { 'includes[]': ['cover_art', 'author', 'artist', 'tag'] },
     });
     cache.set(cacheKey, response.data);
     res.json(response.data);
   } catch (err) {
+    console.error('manga detail error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -72,9 +122,9 @@ app.get('/api/manga/:id/chapters', async (req, res) => {
     const cached = cache.get(cacheKey);
     if (cached) return res.json(cached);
 
-    const response = await axios.get(`${MANGADEX_API}/manga/${req.params.id}/feed`, {
+    const response = await mdx.get(`/manga/${req.params.id}/feed`, {
       params: {
-        'translatedLanguage[]': translatedLanguage,
+        'translatedLanguage[]': [translatedLanguage],
         'order[chapter]': 'asc',
         'includes[]': ['scanlation_group'],
         limit,
@@ -84,6 +134,7 @@ app.get('/api/manga/:id/chapters', async (req, res) => {
     cache.set(cacheKey, response.data);
     res.json(response.data);
   } catch (err) {
+    console.error('chapters error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -108,6 +159,7 @@ app.get('/api/chapter/:id/pages', async (req, res) => {
     cache.set(cacheKey, result);
     res.json(result);
   } catch (err) {
+    console.error('pages error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -119,14 +171,13 @@ app.get('/api/image', async (req, res) => {
     if (!url) return res.status(400).json({ error: 'No URL provided' });
 
     const decoded = decodeURIComponent(url);
-    // Only allow MangaDex CDN origins
     if (!decoded.startsWith('https://uploads.mangadex.org') && !decoded.includes('.mangadex.network')) {
       return res.status(403).json({ error: 'Blocked: non-MangaDex image source' });
     }
 
     const response = await axios.get(decoded, {
       responseType: 'stream',
-      headers: { 'Referer': 'https://mangadex.org' },
+      headers: { Referer: 'https://mangadex.org' },
     });
 
     res.setHeader('Content-Type', response.headers['content-type'] || 'image/jpeg');
@@ -144,16 +195,9 @@ app.get('/api/cover/:mangaId/:filename', async (req, res) => {
     const { size = '256' } = req.query;
     const url = `${MANGADEX_UPLOADS}/covers/${mangaId}/${filename}.${size}.jpg`;
 
-    const cached = cache.get(url);
-    if (cached) {
-      res.setHeader('Content-Type', 'image/jpeg');
-      res.setHeader('Cache-Control', 'public, max-age=86400');
-      return res.send(cached);
-    }
-
     const response = await axios.get(url, {
       responseType: 'stream',
-      headers: { 'Referer': 'https://mangadex.org' },
+      headers: { Referer: 'https://mangadex.org' },
     });
 
     res.setHeader('Content-Type', response.headers['content-type'] || 'image/jpeg');
@@ -164,29 +208,6 @@ app.get('/api/cover/:mangaId/:filename', async (req, res) => {
   }
 });
 
-// ── Popular/trending manga ────────────────────────────────────────────────────
-app.get('/api/manga/popular', async (req, res) => {
-  try {
-    const cacheKey = 'popular';
-    const cached = cache.get(cacheKey);
-    if (cached) return res.json(cached);
-
-    const response = await axios.get(`${MANGADEX_API}/manga`, {
-      params: {
-        limit: 20,
-        'order[followedCount]': 'desc',
-        'includes[]': ['cover_art'],
-        'contentRating[]': ['safe', 'suggestive'],
-        'hasAvailableChapters': true,
-      },
-    });
-    cache.set(cacheKey, response.data, 600); // 10 min for popular
-    res.json(response.data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // ── Tags/genres list ──────────────────────────────────────────────────────────
 app.get('/api/tags', async (req, res) => {
   try {
@@ -194,7 +215,7 @@ app.get('/api/tags', async (req, res) => {
     if (cached) return res.json(cached);
 
     const response = await axios.get(`${MANGADEX_API}/manga/tag`);
-    cache.set('tags', response.data, 3600); // 1 hour
+    cache.set('tags', response.data, 3600);
     res.json(response.data);
   } catch (err) {
     res.status(500).json({ error: err.message });
